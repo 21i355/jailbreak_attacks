@@ -111,7 +111,7 @@ class RandomSwapPerturbation(Perturbation):
         return summarized_string
 
 
-class RandomPatchPerturbation(Perturbation):
+class SummarizationPerturbation(Perturbation):
 
     """Implementation of random patch perturbations.
     See `RandomPatchPerturbation` in lines 6-10 of Algorithm 2."""
