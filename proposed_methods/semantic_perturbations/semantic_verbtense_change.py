@@ -39,7 +39,7 @@ class Perturbation:
         return modified_sentence
 
 
-class RandomSwapPerturbation(Perturbation):
+class VerbTensePerturbation(Perturbation):
 
     """Implementation of random swap perturbations with verb tense changes.
     See `RandomSwapPerturbation` in lines 1-5 of Algorithm 2."""
