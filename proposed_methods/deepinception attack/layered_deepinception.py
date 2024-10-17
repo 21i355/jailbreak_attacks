@@ -94,3 +94,331 @@ with open('/content/deep_inception_perturbations.json', 'w') as f:
     json.dump(output_json, f, indent=4)
 
 print("DeepInception Attack completed and results saved to JSON.")
+
+
+
+#main.py:
+
+import os
+import torch
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+import argparse
+
+import lib.perturbations as perturbations
+import lib.defenses as defenses
+import lib.attacks as attacks
+import lib.language_models as language_models
+import lib.model_configs as model_configs
+
+import sys
+sys.path.append('/content/SafeDecoding')
+sys.path.append('../')
+print("appened")
+
+from SafeDecoding.exp.helper import SafeDecodingManager
+
+def main(args):
+
+    # Get the directory where the script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Dynamically adjust paths
+    args.results_dir = os.path.join(script_dir, args.results_dir)
+    args.attack_logfile = os.path.join(script_dir, args.attack_logfile)
+
+    # Create output directories
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    print("initializing safedecoding")
+    # Instantiate the targeted LLM
+    safeDecodingLLM = SafeDecodingManager()
+
+    # Create SmoothLLM instance
+    defense = defenses.SmoothLLM(
+        target_model=safeDecodingLLM,
+        pert_type=args.smoothllm_pert_type,
+        pert_pct=args.smoothllm_pert_pct,
+        num_copies=args.smoothllm_num_copies
+    )
+
+    # Create attack instance, used to create prompts
+    attack = vars(attacks)[args.attack](
+        logfile=args.attack_logfile,
+        target_model=safeDecodingLLM
+    )
+
+    jailbroken_results = []
+    outputs = []
+    for prompt in tqdm(attack.prompts):
+        output = defense(prompt)
+        outputs.append(output)
+        jb = defense.is_jailbroken(output)
+        jailbroken_results.append(jb)
+    import json
+
+    # Create output file path
+    output_file_path = os.path.join(args.results_dir, 'output.json')
+
+    # Append each output to the JSON file
+    with open(output_file_path, 'w') as output_file:
+        output_json = {"outputs": outputs}
+        output_file.write(json.dumps(output_json,indent=4))
+    num_errors = len([res for res in jailbroken_results if res])
+    print(f'We made {num_errors} errors')
+
+    # Save results to a pandas DataFrame
+    summary_df = pd.DataFrame.from_dict({
+        'Number of smoothing copies': [args.smoothllm_num_copies],
+        'Perturbation type': [args.smoothllm_pert_type],
+        'Perturbation percentage': [args.smoothllm_pert_pct],
+        'JB percentage': [np.mean(jailbroken_results) * 100],
+        'Trial index': [args.trial]
+    })
+    summary_df.to_pickle(os.path.join(
+        args.results_dir, 'summary.pd'
+    ))
+    print(summary_df)
+
+
+if __name__ == '__main__':
+    torch.cuda.empty_cache()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--results_dir',
+        type=str,
+        default='./results'
+    )
+    parser.add_argument(
+        '--trial',
+        type=int,
+        default=0
+    )
+
+    # Targeted LLM
+    parser.add_argument(
+        '--target_model',
+        type=str,
+        default='vicuna',
+        choices=['vicuna', 'llama2','llama3.1']
+    )
+
+    # Attacking LLM
+    parser.add_argument(
+        '--attack',
+        type=str,
+        default='GCG',
+        choices=['GCG', 'PAIR','DeepInception']
+    )
+    parser.add_argument(
+        '--attack_logfile',
+        type=str,
+        default='data/GCG/vicuna_behaviors.json'
+    )
+
+    # SmoothLLM
+    parser.add_argument(
+        '--smoothllm_num_copies',
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        '--smoothllm_pert_pct',
+        type=int,
+        default=10
+    )
+    parser.add_argument(
+        '--smoothllm_pert_type',
+        type=str,
+        default='RandomSwapPerturbation',
+        choices=[
+            'RandomSwapPerturbation',
+            'RandomPatchPerturbation',
+            'RandomInsertPerturbation'
+        ]
+    )
+
+    args = parser.parse_args()
+    main(args)
+
+
+#attacks.py:
+
+import json
+import pandas as pd
+
+class Prompt:
+    def __init__(self, full_prompt, perturbable_prompt, max_new_tokens):
+        self.full_prompt = full_prompt
+        self.perturbable_prompt = perturbable_prompt
+        self.max_new_tokens = max_new_tokens
+
+    def perturb(self, perturbation_fn):
+        perturbed_prompt = perturbation_fn(self.perturbable_prompt)
+        self.full_prompt = self.full_prompt.replace(
+            self.perturbable_prompt,
+            perturbed_prompt
+        )
+        self.perturbable_prompt = perturbed_prompt
+
+class Attack:
+    def __init__(self, logfile, target_model):
+        self.logfile = logfile
+        self.target_model = target_model
+
+class GCG(Attack):
+
+    """Greedy Coordinate Gradient attack.
+
+    Title: Universal and Transferable Adversarial Attacks on 
+                Aligned Language Models
+    Authors: Andy Zou, Zifan Wang, J. Zico Kolter, Matt Fredrikson
+    Paper: https://arxiv.org/abs/2307.15043
+    """
+
+    def __init__(self, logfile, target_model):
+        super(GCG, self).__init__(logfile, target_model)
+
+        with open(self.logfile, 'r') as f:
+            log = json.load(f)
+
+        self.goals = log['goal']
+        self.targets = log['target']
+        self.controls = log['controls']
+
+        self.prompts = [
+            self.create_prompt(g, c, t)
+            for (g, c, t) in zip(self.goals, self.controls, self.targets)
+        ]
+
+    def create_prompt(self, goal, control, target, max_new_len=100):
+        """Create GCG prompt."""
+
+        max_new_tokens = max(
+            len(self.target_model.tokenizer(target).input_ids) + 2,
+            max_new_len
+        )
+
+        # Create full prompt for LLM
+        conv_template = self.target_model.conv_template
+        conv_template.append_message(
+            conv_template.roles[0], f"{goal} {control}"
+        )
+        conv_template.append_message(conv_template.roles[1], f"")
+        prompt = conv_template.get_prompt()
+
+        # As per the GCG source code, we encode then decode the full prompt
+        encoding = self.target_model.tokenizer(prompt)
+        full_prompt = self.target_model.tokenizer.decode(
+            encoding.input_ids
+        ).replace('<s>','').replace('</s>','')
+
+        # Clear the conv template
+        conv_template.messages = []
+        
+        start_index = full_prompt.find(goal)
+        end_index = full_prompt.find(control) + len(control)
+        perturbable_prompt = full_prompt[start_index:end_index]
+        
+        return Prompt(
+            full_prompt, 
+            perturbable_prompt, 
+            max_new_tokens
+        )
+
+class PAIR(Attack):
+
+    """Prompt Automatic Iterative Refinement (PAIR) attack.
+
+    Title: Jailbreaking Black Box Large Language Models in Twenty Queries
+    Authors: Patrick Chao, Alexander Robey, Edgar Dobriban, Hamed Hassani, 
+                George J. Pappas, Eric Wong
+    Paper: https://arxiv.org/abs/2310.08419
+    """
+
+    def __init__(self, logfile, target_model):
+        super(PAIR, self).__init__(logfile, target_model)
+
+        df = pd.read_pickle(logfile)
+        jailbreak_prompts = df['jailbreak_prompt'].to_list()
+        
+        self.prompts = [
+            self.create_prompt(prompt)
+            for prompt in jailbreak_prompts
+        ]
+        
+    def create_prompt(self, prompt):
+
+        conv_template = self.target_model.conv_template
+        conv_template.append_message(conv_template.roles[0], prompt)
+        conv_template.append_message(conv_template.roles[1], None)
+        full_prompt = conv_template.get_prompt()
+
+        # Clear the conv template
+        conv_template.messages = []
+
+        return Prompt(
+            full_prompt,
+            prompt,
+            max_new_tokens=100
+        )
+
+class DeepInception(Attack):
+    """Deep Inception Attack.
+
+    This class will load adversarial perturbations from a JSON file
+    and generate prompts for the target model.
+    """
+
+    def __init__(self, logfile, target_model):
+        super(DeepInception, self).__init__(logfile, target_model)
+
+        # Load perturbations from JSON file
+        with open(logfile, 'r') as f:
+            data = json.load(f)
+        
+        self.goals = data['goal']
+        self.targets = data['target']
+        self.perturbations = data['controls']
+
+        # Create prompts for each goal, perturbation, and target
+        self.prompts = [
+            self.create_prompt(g, p, t)
+            for g, p, t in zip(self.goals, self.perturbations, self.targets)
+        ]
+
+    def create_prompt(self, goal, perturbation, target, max_new_len=100):
+        """Create Deep Inception prompt."""
+
+        # Define max_new_tokens based on target length
+        max_new_tokens = max(
+            len(self.target_model.tokenizer(target).input_ids) + 2,
+            max_new_len
+        )
+
+        # Construct the full prompt
+        conv_template = self.target_model.conv_template
+        conv_template.append_message(conv_template.roles[0], f"{goal} {perturbation}")
+        conv_template.append_message(conv_template.roles[1], "")
+        full_prompt = conv_template.get_prompt()
+
+        # As with GCG, encode then decode the full prompt
+        encoding = self.target_model.tokenizer(full_prompt)
+        full_prompt = self.target_model.tokenizer.decode(
+            encoding.input_ids
+        ).replace('<s>', '').replace('</s>', '')
+
+        # Clear the conversation template for the next prompt
+        conv_template.messages = []
+
+        start_index = full_prompt.find(goal)
+        end_index = full_prompt.find(perturbation) + len(perturbation)
+        perturbable_prompt = full_prompt[start_index:end_index]
+
+        return Prompt(
+            full_prompt,
+            perturbable_prompt,
+            max_new_tokens
+        )
+
